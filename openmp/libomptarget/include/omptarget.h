@@ -232,7 +232,7 @@ void *llvm_omp_target_dynamic_shared_alloc();
 void __tgt_register_requires(int64_t flags);
 
 /// adds a target shared library to the target execution image
-void __tgt_register_lib(__tgt_bin_desc *desc);
+void __tgt_register_lib(__tgt_bin_desc *desc, bool writeImage=false);
 
 /// Initialize all RTLs at once
 void __tgt_init_all_rtls();

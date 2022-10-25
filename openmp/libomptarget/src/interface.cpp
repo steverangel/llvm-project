@@ -30,13 +30,18 @@ EXTERN void __tgt_register_requires(int64_t flags) {
 
 ////////////////////////////////////////////////////////////////////////////////
 /// adds a target shared library to the target execution image
-EXTERN void __tgt_register_lib(__tgt_bin_desc *desc) {
+EXTERN void __tgt_register_lib(__tgt_bin_desc *desc, bool writeImage) {
   TIMESCOPE();
   std::call_once(PM->RTLs.initFlag, &RTLsTy::LoadRTLs, &PM->RTLs);
   for (auto &RTL : PM->RTLs.AllRTLs) {
     if (RTL.register_lib) {
       if ((*RTL.register_lib)(desc) != OFFLOAD_SUCCESS) {
         DP("Could not register library with %s", RTL.RTLName.c_str());
+      }
+      else {
+        if (writeImage) {
+          ;//DP("Writing image for replay.");
+        }
       }
     }
   }
@@ -106,7 +111,7 @@ EXTERN void __tgt_target_data_begin_mapper(ident_t *loc, int64_t device_id,
 #ifdef OMPTARGET_DEBUG
   for (int i = 0; i < arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
-       ", Type=0x%" PRIx64 ", Name=%s\n",
+       ", Type=0x%" PRIx64 ", Name=%s TEST0\n",
        i, DPxPTR(args_base[i]), DPxPTR(args[i]), arg_sizes[i], arg_types[i],
        (arg_names) ? getNameFromMapping(arg_names[i]).c_str() : "unknown");
   }
@@ -175,7 +180,7 @@ EXTERN void __tgt_target_data_end_mapper(ident_t *loc, int64_t device_id,
 #ifdef OMPTARGET_DEBUG
   for (int i = 0; i < arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
-       ", Type=0x%" PRIx64 ", Name=%s\n",
+       ", Type=0x%" PRIx64 ", Name=%s TEST1\n",
        i, DPxPTR(args_base[i]), DPxPTR(args[i]), arg_sizes[i], arg_types[i],
        (arg_names) ? getNameFromMapping(arg_names[i]).c_str() : "unknown");
   }
@@ -293,7 +298,7 @@ EXTERN int __tgt_target_mapper(ident_t *loc, int64_t device_id, void *host_ptr,
 #ifdef OMPTARGET_DEBUG
   for (int i = 0; i < arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
-       ", Type=0x%" PRIx64 ", Name=%s\n",
+       ", Type=0x%" PRIx64 ", Name=%s TEST2\n",
        i, DPxPTR(args_base[i]), DPxPTR(args[i]), arg_sizes[i], arg_types[i],
        (arg_names) ? getNameFromMapping(arg_names[i]).c_str() : "unknown");
   }
@@ -367,7 +372,7 @@ EXTERN int __tgt_target_teams_mapper(ident_t *loc, int64_t device_id,
 #ifdef OMPTARGET_DEBUG
   for (int i = 0; i < arg_num; ++i) {
     DP("Entry %2d: Base=" DPxMOD ", Begin=" DPxMOD ", Size=%" PRId64
-       ", Type=0x%" PRIx64 ", Name=%s\n",
+       ", Type=0x%" PRIx64 ", Name=%s TEST3\n",
        i, DPxPTR(args_base[i]), DPxPTR(args[i]), arg_sizes[i], arg_types[i],
        (arg_names) ? getNameFromMapping(arg_names[i]).c_str() : "unknown");
   }

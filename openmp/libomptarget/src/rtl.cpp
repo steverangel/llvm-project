@@ -21,6 +21,13 @@
 #include <mutex>
 #include <string>
 
+// TODO -- NEW CODE
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include <iostream>
+#include<fstream>
+
 // List of all plugins that can support offloading.
 static const char *RTLNames[] = {
     /* PowerPC target       */ "libomptarget.rtl.ppc64.so",
@@ -351,7 +358,7 @@ void RTLsTy::initAllRTLs() {
     initRTLonce(R);
 }
 
-void RTLsTy::RegisterLib(__tgt_bin_desc *desc) {
+void RTLsTy::RegisterLib(__tgt_bin_desc *desc, bool writeImage) {
   PM->RTLsMtx.lock();
   // Register the images with the RTLs that understand them, if any.
   for (int32_t i = 0; i < desc->NumDeviceImages; ++i) {
@@ -371,6 +378,78 @@ void RTLsTy::RegisterLib(__tgt_bin_desc *desc) {
 
       DP("Image " DPxMOD " is compatible with RTL %s!\n",
          DPxPTR(img->ImageStart), R.RTLName.c_str());
+
+      // NEW CODE RECORD
+      if (true || writeImage) {
+        // struct __tgt_bin_desc {
+        //   int32_t NumDeviceImages;           // Number of device types supported
+        //   __tgt_device_image *DeviceImages;  // Array of device images (1 per dev. type)
+        //   __tgt_offload_entry *HostEntriesBegin; // Begin of table with all host entries
+        //   __tgt_offload_entry *HostEntriesEnd;   // End of table (non inclusive)
+        // };
+
+        // just store one image: the one that is going to execute
+        std::string DeviceImageFile = std::string(std::string(R.RTLName.c_str()) + ".device_image.bin");
+        DP("Writing image " DPxMOD " as ./tgt_device_image.bin for replay with RTL %s!\n",
+             DPxPTR(img->ImageStart), R.RTLName.c_str());
+        std::ofstream tgt_device_image_file(DeviceImageFile, std::ios::out | std::ios::binary);
+        if (!tgt_device_image_file)
+          ;// TODO error opening file
+        tgt_device_image_file.write((char*)img->ImageStart, static_cast<char*>(img->ImageEnd) - static_cast<char*>(img->ImageStart));
+        tgt_device_image_file.close();
+        if (!tgt_device_image_file.good())
+          ;// TODO error writing
+
+        llvm::json::Object JsonTgtBinDesc;
+        JsonTgtBinDesc["NumDeviceImages"] = 1;
+
+        llvm::json::Array JsonDeviceImages;
+
+        llvm::json::Object JsonDeviceImage;
+        JsonDeviceImage["ImageFile"] = DeviceImageFile;
+        JsonDeviceImage["ImageStart"] = (uint64_t)img->ImageStart;
+        JsonDeviceImage["ImageEnd"] = (uint64_t)img->ImageEnd;
+        llvm::json::Array JsonDeviceImageEntries;
+        for (__tgt_offload_entry *entry = img->EntriesBegin; entry != img->EntriesEnd; ++entry)
+        {
+          llvm::json::Object JsonDeviceImageEntry;
+          JsonDeviceImageEntry["addr"] = (uint64_t)entry->addr;
+          JsonDeviceImageEntry["name"] = entry->name;
+          JsonDeviceImageEntry["size"] = entry->size;
+          JsonDeviceImageEntry["flags"] = entry->flags;
+          JsonDeviceImageEntry["reserved"] = entry->reserved;
+          JsonDeviceImageEntries.push_back(std::move(JsonDeviceImageEntry));
+          //DP("Device entry addr: " DPxMOD "\n", DPxPTR(entry->addr));
+          //DP("Device entry name: %s\n", entry->name);
+          //DP("Device entry size: %lu\n", entry->size);  // size 0 is a function
+        }
+        JsonDeviceImage["Entries"] = std::move(JsonDeviceImageEntries);
+
+        JsonDeviceImages.push_back(std::move(JsonDeviceImage));
+        JsonTgtBinDesc["DeviceImages"] = std::move(JsonDeviceImages);
+
+        llvm::json::Array JsonHostEntries;
+        for (__tgt_offload_entry *entry = desc->HostEntriesBegin; entry != desc->HostEntriesEnd; ++entry)
+        {
+          llvm::json::Object JsonHostEntry;
+          JsonHostEntry["addr"] = (uint64_t)entry->addr;
+          JsonHostEntry["name"] = entry->name;
+          JsonHostEntry["size"] = entry->size;
+          JsonHostEntry["flags"] = entry->flags;
+          JsonHostEntry["reserved"] = entry->reserved;
+          JsonHostEntries.push_back(std::move(JsonHostEntry));
+        }
+        JsonTgtBinDesc["HostEntries"] = std::move(JsonHostEntries);
+
+        llvm::json::Value JsonVal(std::move(JsonTgtBinDesc));
+
+        std::error_code EC;
+        llvm::raw_fd_ostream JsonOut("tgt_bin_desc.json", EC, llvm::sys::fs::OF_Text);
+        //JsonOut << llvm::formatv("{0}", JsonVal); // won't compile, use clang-format to view
+        JsonOut << JsonVal;
+        JsonOut.close();
+      }
+      // END NEW REPLAY CODE
 
       initRTLonce(R);
 

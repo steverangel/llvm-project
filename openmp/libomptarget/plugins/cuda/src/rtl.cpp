@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cuda.h>
+#include <cuda_runtime.h>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -32,6 +33,13 @@
 #include "MemoryManager.h"
 
 #include "llvm/Frontend/OpenMP/OMPConstants.h"
+
+// TODO -- NEW CODE
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include <iostream>
+#include<fstream>
 
 // Utility for retrieving and printing CUDA error string.
 #ifdef OMPTARGET_DEBUG
@@ -422,8 +430,150 @@ class DeviceRTLTy {
     }
   };
 
+  /// Another class responsible for interacting with device native runtime library to
+  /// allocate and free POOLED memory using a bump allocator.
+  class CUDADeviceBumpAllocatorTy : public DeviceAllocatorTy {
+    std::unordered_map<void *, TargetAllocTy> HostPinnedAllocs;
+
+  private:
+    CUdeviceptr HeapStart;
+    CUdeviceptr HeapEnd;
+    CUdeviceptr Next;
+    size_t Allocations;
+    const size_t HeapSize = 1 << 30; // 1 GiB
+    
+    void init() {
+      DP("CUDADeviceBumpAllocator init\n");
+      if (HeapStart != 0) {
+        printf("Error CUDADeviceBumpAllocator init called but already initialized\n");
+        return;
+      }
+      printf("Initializing the bump allocator\n");
+      CUresult Err = cuMemAlloc(&HeapStart, HeapSize);
+      if (!checkResult(Err, "Error returned from cuMemAlloc in CUDADeviceBumpAllocator init\n"))
+        return;
+      HeapEnd = HeapStart + HeapSize;
+      Next = HeapStart;
+      Allocations = 0;
+      return;
+    }
+
+    void deinit() {
+      DP("CUDADeviceBumpAllocator deinit\n");
+      if (HeapStart == 0) {
+        printf("Error CUDADeviceBumpAllocator deinit called but not initialized)");;
+        return;
+      }
+      CUresult Err = cuMemFree(HeapStart);
+      checkResult(Err, "Error returned from cuMemFree in bump allocator: deinit\n");
+      HeapStart = 0;
+      HeapEnd = 0;
+      Next = 0;
+      Allocations = 0;
+      return;
+    }
+
+  public:
+    CUDADeviceBumpAllocatorTy() : HeapStart(0), HeapEnd(0), Next(0), Allocations(0) {}
+    ~CUDADeviceBumpAllocatorTy() {}
+
+    void dumpHeap(const char* filename) const {
+      void *HostPtr;
+      CUresult Err = cuMemAllocHost(&HostPtr, HeapSize);
+      if (!checkResult(Err, "Error returned from cuMemAllocHost\n"))
+        return;
+      cuMemcpyDtoH(HostPtr, HeapStart, HeapSize);
+      std::ofstream heapfile(filename, std::ios::out | std::ios::binary);
+      if (!heapfile)
+        ;//error
+      heapfile.write(static_cast<char*>(HostPtr), HeapSize);
+      heapfile.close();
+      if (!heapfile.good())
+        ;//error
+      cuMemFreeHost(HostPtr);
+      return;
+    }
+
+    CUdeviceptr getHeapStart() const { return HeapStart; }
+
+    CUdeviceptr getHeapEnd() const { return HeapEnd; }
+
+    int getNumAllocations() const { return Allocations; }
+
+    void *allocate(size_t Size, void *, TargetAllocTy Kind) override {
+      if (Size == 0)
+        return nullptr;
+      void *MemAlloc = nullptr;
+      CUresult Err;
+      switch (Kind) {
+      case TARGET_ALLOC_DEFAULT:
+      case TARGET_ALLOC_DEVICE:
+        if (HeapStart == 0)  // allocate pool on first allocation
+          init();
+        if (Next + Size > HeapEnd) {
+          printf("Error not enough pool memory\n");
+          return nullptr;
+        }
+        else {
+          MemAlloc = (void *)Next;
+          Next += Size;
+          ++Allocations;
+        }
+        DP("CUDADeviceBumpAllocator allocate %llx\n", (CUdeviceptr)MemAlloc);
+        break;
+      case TARGET_ALLOC_HOST:
+        void *HostPtr;
+        Err = cuMemAllocHost(&HostPtr, Size);
+        MemAlloc = HostPtr;
+        if (!checkResult(Err, "Error returned from cuMemAllocHost\n"))
+          return nullptr;
+        HostPinnedAllocs[MemAlloc] = Kind;
+        break;
+      case TARGET_ALLOC_SHARED:
+        CUdeviceptr SharedPtr;
+        Err = cuMemAllocManaged(&SharedPtr, Size, CU_MEM_ATTACH_GLOBAL);
+        MemAlloc = (void *)SharedPtr;
+        if (!checkResult(Err, "Error returned from cuMemAllocManaged\n"))
+          return nullptr;
+        break;
+      }
+
+      return MemAlloc;
+    }
+
+    int free(void *TgtPtr) override {
+      CUresult Err;
+      // Host pinned memory must be freed differently.
+      TargetAllocTy Kind =
+          (HostPinnedAllocs.find(TgtPtr) == HostPinnedAllocs.end())
+              ? TARGET_ALLOC_DEFAULT
+              : TARGET_ALLOC_HOST;
+      switch (Kind) {
+      case TARGET_ALLOC_DEFAULT:
+      case TARGET_ALLOC_DEVICE:
+        DP("CUDADeviceBumpAllocator free\n");
+        if (--Allocations == 0)
+          deinit(); // free the pool memory on last free
+        break;
+      case TARGET_ALLOC_SHARED:
+        Err = cuMemFree((CUdeviceptr)TgtPtr);
+        if (!checkResult(Err, "Error returned from cuMemFree\n"))
+          return OFFLOAD_FAIL;
+        break;
+      case TARGET_ALLOC_HOST:
+        Err = cuMemFreeHost(TgtPtr);
+        if (!checkResult(Err, "Error returned from cuMemFreeHost\n"))
+          return OFFLOAD_FAIL;
+        break;
+      }
+
+      return OFFLOAD_SUCCESS;
+    }
+  };
+
   /// A vector of device allocators
-  std::vector<CUDADeviceAllocatorTy> DeviceAllocators;
+    std::vector<CUDADeviceBumpAllocatorTy> DeviceAllocators;
+    //std::vector<CUDADeviceAllocatorTy> DeviceAllocators;
 
   /// A vector of memory managers. Since the memory manager is non-copyable and
   // non-removable, we wrap them into std::unique_ptr.
@@ -1081,9 +1231,41 @@ public:
     for (int I = 0; I < ArgNum; ++I) {
       Ptrs[I] = (void *)((intptr_t)TgtArgs[I] + TgtOffsets[I]);
       Args[I] = &Ptrs[I];
+      std::cout << Ptrs[I] << std::endl;
     }
 
     KernelTy *KernelInfo = reinterpret_cast<KernelTy *>(TgtEntryPtr);
+
+    // TODO -- NEW CODE
+    // At this point here a kernel is about to launch, we probably need
+    // to save the current device memory from the CUDADeviceBumpAllocator.
+
+    DP("CUDADeviceBumpAllocator pool allocations: %d for kernel: %s\n",
+        DeviceAllocators[DeviceId].getNumAllocations(), 
+        getOffloadEntry(DeviceId, TgtEntryPtr)->name);
+  
+    std::string JsonFileName = std::string(getOffloadEntry(DeviceId, TgtEntryPtr)->name) + ".json";
+    std::string HeapFileName = std::string(getOffloadEntry(DeviceId, TgtEntryPtr)->name) + ".heap_dump.bin";
+
+    DeviceAllocators[DeviceId].dumpHeap(HeapFileName.c_str());
+
+    llvm::json::Object JsonObj;
+    JsonObj["name"] = getOffloadEntry(DeviceId, TgtEntryPtr)->name;
+    JsonObj["ArgNum"] = ArgNum;
+    JsonObj["TeamNum"] = TeamNum;
+    JsonObj["ThreadLimit"] = ThreadLimit;
+    JsonObj["LoopTripCount"] = LoopTripCount;
+    JsonObj["HeapFile"] = HeapFileName;
+    JsonObj["HeapStart"] = static_cast<uint64_t>(DeviceAllocators[DeviceId].getHeapStart());
+    JsonObj["HeapEnd"] = static_cast<uint64_t>(DeviceAllocators[DeviceId].getHeapEnd());
+
+    llvm::json::Value JsonVal(std::move(JsonObj));
+
+    std::error_code EC;
+    llvm::raw_fd_ostream JsonOut(JsonFileName, EC, llvm::sys::fs::OF_Text);
+    //JsonOut << llvm::formatv("{0}", JsonVal);
+    JsonOut << JsonVal;
+
 
     const bool IsSPMDGenericMode =
         KernelInfo->ExecutionMode == llvm::omp::OMP_TGT_EXEC_MODE_GENERIC_SPMD;

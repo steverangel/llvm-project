@@ -20,6 +20,14 @@
 #include <cstdint>
 #include <vector>
 
+// TODO -- NEW CODE
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include <iostream>
+#include<fstream>
+#include <sstream>
+
 int AsyncInfoTy::synchronize() {
   int Result = OFFLOAD_SUCCESS;
   if (AsyncInfo.Queue) {
@@ -1541,7 +1549,101 @@ int target(ident_t *loc, DeviceTy &Device, void *HostPtr, int32_t ArgNum,
   DP("Launching target execution %s with pointer " DPxMOD " (index=%d).\n",
      TargetTable->EntriesBegin[TM->Index].name, DPxPTR(TgtEntryPtr), TM->Index);
 
-  {
+  // REPLAY
+  void *TgtPtr = nullptr;
+  
+  // read json with target args
+  // allocate gpu buffer and copy
+  // recalculate the target args for non-literals
+  if (ArgSizes != nullptr && *ArgSizes == 0x5245504C41594D45) {
+    //DP("Loading device kernel arguments.\n");
+    //DP("kernel json: %s\n", (char*)(Args[0]));
+    Ret = OFFLOAD_SUCCESS;  // FIXME
+
+    std::string json_filename = std::string((char*)(Args[0])) + ".json";
+    std::ifstream json_file(json_filename);
+    std::stringstream buffer;
+    buffer << json_file.rdbuf();
+    json_file.close();
+    std::string JsonStr = buffer.str();
+    llvm::StringRef JsonStrRef(JsonStr);
+    llvm::Expected<llvm::json::Value> Exp = llvm::json::parse(JsonStrRef);
+    if (auto Err = Exp.takeError())
+      return 1;
+    llvm::Optional<int64_t> HeapStart  = Exp->getAsObject()->getInteger("HeapStart");
+    llvm::Optional<int64_t> HeapEnd  = Exp->getAsObject()->getInteger("HeapEnd");
+    llvm::Optional<llvm::StringRef> HeapFile  = Exp->getAsObject()->getString("HeapFile");
+    // read binary
+    std::string device_memory_filename = std::string(std::string((char*)(Args[0])) + ".heap_dump.bin");
+    std::ifstream device_memory_file;
+    std::cout << "Opening " << device_memory_filename << std::endl;
+    device_memory_file.open(device_memory_filename, std::ios::binary | std::ios::in);
+    device_memory_file.seekg(0, device_memory_file.end);
+    size_t length = device_memory_file.tellg();
+    std::cout << "length " << length << std::endl;
+    assert(HeapEnd.getValue() - HeapStart.getValue() == length);
+    device_memory_file.seekg(0, device_memory_file.beg);
+    std::vector<char> readBuff(length);
+    device_memory_file.read(&readBuff[0], length);
+    device_memory_file.close();
+    // end read binary
+    TgtPtr = Device.allocData(length, &readBuff[0]);
+    // Transfer data to target device
+    int Ret = Device.submitData(TgtPtr, &readBuff[0], length, AsyncInfo);
+    // read json target args
+    std::string json_args_filename = std::string((char*)(Args[0])) + ".target_args.json";
+    std::ifstream json_args_file(json_args_filename);
+    std::stringstream args_buffer;
+    args_buffer << json_args_file.rdbuf();
+    json_args_file.close();
+    std::string JsonArgsStr = args_buffer.str();
+    llvm::StringRef JsonArgsStrRef(JsonArgsStr);
+    llvm::Expected<llvm::json::Value> ArgsExp = llvm::json::parse(JsonArgsStrRef);
+    if (auto Err = ArgsExp.takeError())
+      return 1;
+    TeamNum = ArgsExp->getAsObject()->getInteger("TeamNum").getValue();
+    ThreadLimit = ArgsExp->getAsObject()->getInteger("ThreadLimit").getValue();
+    llvm::json::Array *TgtArgsJson = ArgsExp->getAsObject()->getArray("TgtArgs");
+    assert(TgtArgs.empty());  // for replay this is empty
+    for (llvm::json::Array::iterator I = TgtArgsJson->begin(); I != TgtArgsJson->end(); ++I)
+    {
+      TgtArgs.push_back((void*)I->getAsObject()->getInteger("arg").getValue());
+      TgtOffsets.push_back((ptrdiff_t)I->getAsObject()->getInteger("offset").getValue());
+      if (!I->getAsObject()->getBoolean("isLiteral").getValue())
+        TgtArgs.back() = (void*)((uint64_t)TgtArgs.back() - HeapStart.getValue() + (uint64_t)TgtPtr);
+    }
+  }
+
+  // NORMAL EXECUTION
+  // write a json with the target args and tag literals
+  if (ArgSizes != nullptr && *ArgSizes != 0x5245504C41594D45) {
+    llvm::json::Object JsonTgtObj;
+    llvm::json::Array JsonTgtArgs;
+    for (int i = 0; i < TgtArgs.size(); ++i) {
+      DP("Entry %2d: TgtArgs=" DPxMOD ", TgtOffsets=" DPxMOD ", Size=%" PRId64
+         ", Type=0x%" PRIx64 ", isLiteral=%2d\n",
+         i, DPxPTR(TgtArgs[i]), DPxPTR(TgtOffsets[i]), 
+         ArgSizes[i], ArgTypes[i], ArgTypes[i] & OMP_TGT_MAPTYPE_LITERAL ? 1 : 0);
+
+      llvm::json::Object JsonTgtArg;
+      JsonTgtArg["arg"] = (uint64_t)TgtArgs[i];
+      JsonTgtArg["offset"] = (uint64_t)TgtOffsets[i];
+      JsonTgtArg["isLiteral"] = (bool)(ArgTypes[i] & OMP_TGT_MAPTYPE_LITERAL);
+      JsonTgtArgs.push_back(std::move(JsonTgtArg));
+    }
+    JsonTgtObj["TgtArgs"] = std::move(JsonTgtArgs); 
+    JsonTgtObj["TeamNum"] = TeamNum;
+    JsonTgtObj["ThreadLimit"] = ThreadLimit;
+    llvm::json::Value JsonVal(std::move(JsonTgtObj));
+    std::string filename = std::string(TargetTable->EntriesBegin[TM->Index].name) + ".target_args.json";
+    std::error_code EC;
+    llvm::raw_fd_ostream JsonOut(filename, EC, llvm::sys::fs::OF_Text);
+    JsonOut << JsonVal;
+    JsonOut.close();
+  }
+
+  //if (*ArgSizes!=0x5245504C41594D45) { 
+   {
     TIMESCOPE_WITH_NAME_AND_IDENT(
         IsTeamConstruct ? "runTargetTeamRegion" : "runTargetRegion", loc);
     if (IsTeamConstruct)
@@ -1568,6 +1670,10 @@ int target(ident_t *loc, DeviceTy &Device, void *HostPtr, int32_t ArgNum,
       REPORT("Failed to process data after launching the kernel.\n");
       return OFFLOAD_FAIL;
     }
+  }
+
+  if (ArgSizes != nullptr && *ArgSizes == 0x5245504C41594D45 && TgtPtr != nullptr) {
+      int Ret = Device.deleteData(TgtPtr);
   }
 
   return OFFLOAD_SUCCESS;

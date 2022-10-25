@@ -147,7 +147,7 @@ struct RTLsTy {
   void initAllRTLs();
 
   // Register a shared library with all (compatible) RTLs.
-  void RegisterLib(__tgt_bin_desc *desc);
+  void RegisterLib(__tgt_bin_desc *desc, bool writeImage=false);
 
   // Unregister a shared library from all RTLs.
   void UnregisterLib(__tgt_bin_desc *desc);
